@@ -1,7 +1,9 @@
 # Derivatives [![CircleCI](https://circleci.com/gh/martinklepsch/derivatives.svg?style=svg)](https://circleci.com/gh/martinklepsch/derivatives)
 
+[usage](#usage) | [comparisons](#comparisons) | [change log](https://github.com/martinklepsch/derivatives/blob/master/CHANGES.md)
+
 **A note on terminology:** There are a lot of things with similar meanings/use-cases around: subscriptions, reactions, derived atoms, view models. 
-I'll introduce another to make things even worse: *derivative*. A *derivative* implements `IWatchable` and it's value is the result of applying a function to the value of other things (*sources*) implementing `IWatchable`. Whenever any of the *sources* change the value if the *derivative* is updated.
+I'll introduce another to make things even worse: *derivative*. A *derivative* implements `IWatchable` and it's value is the result of applying a function to the value of other things (*sources*) implementing `IWatchable`. Whenever any of the *sources* change the value of the *derivative* is updated.
 
 ## Why this library
 
@@ -31,9 +33,11 @@ A secondary objective is also to achieve the above without relying on global sta
 
 ## Usage
 
+[](dependency)
 ```clojure
-[org.martinklepsch/derivatives "0.1.1"]
+[org.martinklepsch/derivatives "0.2.0"] ;; latest release
 ```
+[](/dependency)
 
 *Derivatives* of your application state can be defined via a kind of specification like the one below:
 
@@ -75,7 +79,7 @@ The `rum-derivatives` mixin adds two functions to the React context of all child
 
 ## Comparisons
 
-##### Plain `rum.core/derived-atom`
+#### Plain `rum.core/derived-atom`
 
 Rum's derived-atoms serve as building block in this library but there are some things which are (rightfully) not solved by derived-atoms:
 
@@ -109,13 +113,13 @@ compared with the way this could be described using *derivatives*:
   ;; {name    [depends-upon     derive-fn]}
   {:db        [[]               *db]
    :increased [[:db]            (fn [db] (inc (:count db)))]
-   :as-map    [[:db :increased] (fn [db incd] {:db db :increased inch})]})
+   :as-map    [[:db :increased] (fn [db incd] {:db db :increased incd})]})
 ```
 
 The benefit here is that we don't use vars to make sure the dependencies are met and that we provide this information in a way that can easily be turned into a dependency graph (data FTW) which will later help us only calculating required *derivatives* (done by `derivatives-manager`). In comparison the first snippet will create derived-atoms and recalculate them whenever any of their dependencies change, no matter if you're using the derived-atom in any of your views.
 
 
-##### Re-Frame Subscriptions
+#### Re-Frame Subscriptions
 
 The way they work Re-Frame's dynamic subscriptions are not much different from the approach chosen here, they vary in two ways however:
 

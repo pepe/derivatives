@@ -3,7 +3,12 @@
             [org.martinklepsch.derived :as derived]
             [clojure.set :as s]
             [rum.core :as rum]
+            [rum.util :as rutil]
             #?(:cljs [goog.object :as gobj])))
+
+(defn prefix-id []
+  #?(:cljs (random-uuid)
+     :clj (java.util.UUID/randomUUID)))
 
 (defn depend'
   "Variation of `depend` that takes a list of dependencies instead of one"
@@ -41,17 +46,17 @@
   "Update the derivatives map `drv-map` so that all keys passed in `order`
   are statisfied and any superfluous keys are removed.
   Values of superfluous keys that implement IDisposable they will also be disposed."
-  [spec drv-map order]
+  [spec watch-key-prefix drv-map order]
   (doseq [drv-val (not-required drv-map (set order))]
     (when (satisfies? derived/IDisposable drv-val)
       (derived/dispose! drv-val)))
   (reduce (fn [m k]
-            (let [[direct-deps derive] (-> spec k)]
+            (let [[direct-deps derive] (get spec k)]
               (if (get m k)
                 m
                 (if (watchable? derive)
                   (assoc m k derive)
-                  (assoc m k (derived/derived-value (map #(get m %) direct-deps) k derive))))))
+                  (assoc m k (derived/derived-value (map #(get m %) direct-deps) [watch-key-prefix k] derive))))))
           (select-keys drv-map order)
           order))
 
@@ -65,23 +70,27 @@
   removing them as soon as they become unused"
   [spec]
   {:pre [(map? spec)]}
-  (sync-derivatives! spec {} (dep/topo-sort (spec->graph spec))))
+  (sync-derivatives! spec (prefix-id) {} (dep/topo-sort (spec->graph spec))))
 
 (defn ^:private required-drvs [graph registry]
   (let [required? (calc-deps graph (keys registry))]
-    (filter required? (dep/topo-sort graph))))
+    (or (seq (filter required? (dep/topo-sort graph)))
+        ;; When only derivatives that don't have any dependencies
+        ;; are used they are not included in the topo-sort result
+        ;; in this case just return the required keys
+        (seq required?))))
 
 (defprotocol IDerivativesPool
   (get! [this drv-k token])
   (release! [this drv-k token]))
 
-(defrecord DerivativesPool [spec graph state]
+(defrecord DerivativesPool [spec watch-key-prefix graph state]
   IDerivativesPool
   (get! [this drv-k token]
     (if-not (get spec drv-k)
       (throw (ex-info (str "No derivative defined for " drv-k) {:key drv-k}))
       (let [new-reg  (update (:registry @state) drv-k (fnil conj #{}) token)
-            new-drvs (sync-derivatives! spec (:derivatives @state) (required-drvs graph new-reg))]
+            new-drvs (sync-derivatives! spec watch-key-prefix (:derivatives @state) (required-drvs graph new-reg))]
         (reset! state {:derivatives new-drvs :registry new-reg})
         (get new-drvs drv-k))))
   (release! [this drv-k token]
@@ -89,7 +98,7 @@
           new-reg   (if (= #{token} (get registry drv-k))
                       (dissoc registry drv-k)
                       (update registry drv-k disj token))
-          new-drvs (sync-derivatives! spec (:derivatives @state) (required-drvs graph new-reg))]
+          new-drvs (sync-derivatives! spec watch-key-prefix (:derivatives @state) (required-drvs graph new-reg))]
       (reset! state {:derivatives new-drvs :registry new-reg})
       nil)))
 
@@ -102,14 +111,24 @@
     is no longer needed by `token`, if there are no more tokens needing
     the derivative it will be removed"
   [spec]
-  (let [dm (->DerivativesPool spec (spec->graph spec) (atom {}))]
+  #_(let [dm (map->DerivativesPool {:spec spec
+                                  :watch-key-prefix (prefix-id)
+                                  :graph (spec->graph spec)
+                                  :state (atom {})})]
     {:get! (partial get! dm)
-     :release! (partial release! dm)}))
+     :release! (partial release! dm)})
+  (map->DerivativesPool {:spec spec
+                         :watch-key-prefix (prefix-id)
+                         :graph (spec->graph spec)
+                         :state (atom {})}))
 
 ;; RUM specific code ===========================================================
 
 (let [get-k     "org.martinklepsch.derivatives/get"
-      release-k "org.martinklepsch.derivatives/release"]
+      release-k "org.martinklepsch.derivatives/release"
+      context-types #?(:cljs {get-k     js/React.PropTypes.func
+                              release-k js/React.PropTypes.func}
+                       :clj  {})]
 
   (defn rum-derivatives
     "Given the passed spec add get!/release! derivative functions to
@@ -117,38 +136,37 @@
     mixin."
     [spec]
     #?(:cljs
-       {:class-properties {:childContextTypes {get-k     js/React.PropTypes.func
-                                               release-k js/React.PropTypes.func}}
-        :child-context    (fn [_] (let [{:keys [release! get!]} (derivatives-pool spec)]
-                                    {release-k release! get-k get!}))}))
+       {:class-properties {:childContextTypes context-types}
+        :child-context    (fn [_] (let [pool (derivatives-pool spec)]
+                                    {release-k (partial release! pool)
+                                     get-k (partial get! pool)}))}))
 
   (defn rum-derivatives*
     "Like rum-derivatives but get the spec from the arguments passed to the components (`:rum/args`) using `get-spec-fn`"
     [get-spec-fn]
     #?(:cljs
-       {:class-properties {:childContextTypes {get-k     js/React.PropTypes.func
-                                               release-k js/React.PropTypes.func}}
+       {:class-properties {:childContextTypes context-types}
         :init             (fn [s _] (assoc s ::spec (get-spec-fn (:rum/args s))))
-        :child-context    (fn [s] (let [{:keys [release! get!]} (derivatives-pool (::spec s))]
-                                    {release-k release! get-k get!}))}))
+        :child-context    (fn [s] (let [pool (derivatives-pool (::spec s))]
+                                    {release-k (partial release! pool)
+                                     get-k (partial get! pool)}))}))
 
   (defn drv
-    "Rum mixin to retrieve a derivative for `:drv-k` using the functions in the component context
+    "Rum mixin to retrieve derivatives for `drv-ks` using the functions in the component context
      To get the derived-atom use `get-ref` for swappable client/server behavior"
-    [drv-k]
+    [& drv-ks]
     #?(:cljs
        (let [token (rand-int 10000)] ; TODO think of something better here
-         {:class-properties {:contextTypes {get-k     js/React.PropTypes.func
-                                            release-k js/React.PropTypes.func}}
+         (assert (seq drv-ks) "The drv mixin needs at least one derivative ID")
+         {:class-properties {:contextTypes context-types}
           :will-mount    (fn [s]
                            (let [get-drv! (-> s :rum/react-component (gobj/get "context") (gobj/get get-k))]
                              (assert get-drv! "No get! derivative function found in component context")
-                             (assoc-in s [::derivatives drv-k] (get-drv! drv-k token))))
+                             (reduce #(assoc-in %1 [::derivatives %2] (get-drv! %2 token)) s drv-ks)))
           :will-unmount  (fn [s]
                            (let [release-drv! (-> s :rum/react-component (gobj/get "context") (gobj/get release-k))]
                              (assert release-drv! "No release! derivative function found in component context")
-                             (release-drv! drv-k token)
-                             (update s ::derivatives dissoc drv-k)))}))))
+                             (reduce #(do (release-drv! %2 token) (update %1 ::derivatives dissoc %2)) s drv-ks)))}))))
 
 (def ^:dynamic *derivatives* nil)
 
@@ -160,12 +178,21 @@
          :clj  (get *derivatives* drv-k))
       (throw (ex-info (str "No derivative found! Maybe you forgot a (drv " drv-k ") mixin?")
                       {:key drv-k :derivatives #?(:cljs (keys (::derivatives state))
-                                                  :clj (keys *derivatives*))}))))
+                                                  :clj  (keys *derivatives*))}))))
 
 (defn react
   "Like `get-ref` wrapped in `rum.core/react`"
   [state drv-k]
   (rum/react (get-ref state drv-k)))
+
+(defn react-all
+  "React to multiple derivatives in the components state.
+   If any `ks` are passed, react to those and return their values
+   in a map. If no `ks` is passed return all available derivatives
+   deref'ed as a map."
+  [state & ks]
+  (let [ks (or (seq ks) (-> state ::derivatives keys))]
+    (zipmap ks (map #(react state %) ks))))
 
 (comment 
   (def base (atom 0))
